@@ -1,5 +1,6 @@
 
 import json
+import os
 import re
 
 import ollama
@@ -9,15 +10,17 @@ from pydantic import BaseModel, Field
 
 app = FastAPI(
     title="WildQuest API",
-    description="Outdoor adventures powered by local Gemma AI",
-    version="1.0.0",
+    description="Outdoor adventures powered by AI",
+    version="1.1.0",
 )
 
+# Local Vite frontend + deployed Vercel frontend
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[
         "http://localhost:5173",
         "http://127.0.0.1:5173",
+        "https://wild-quest-psi.vercel.app",
     ],
     allow_credentials=False,
     allow_methods=["GET", "POST"],
@@ -49,16 +52,22 @@ class QuestResponse(BaseModel):
 
 @app.get("/api/health")
 def health():
+    provider = (
+        "gemini"
+        if os.getenv("GEMINI_API_KEY")
+        or os.getenv("GOOGLE_GENERATIVE_AI_API_KEY")
+        else "ollama"
+    )
     return {
         "status": "ok",
         "app": "WildQuest",
-        "model": "gemma3:4b",
+        "model": "gemini" if provider == "gemini" else "gemma3:4b",
+        "provider": provider,
     }
 
 
-@app.post("/api/quests", response_model=QuestResponse)
-def generate_quests(request: QuestRequest):
-    prompt = f"""
+def build_prompt(request: QuestRequest) -> str:
+    return f"""
 You create safe, engaging outdoor observation missions.
 
 Generate exactly 3 distinct missions for a {request.duration}-minute
@@ -89,31 +98,101 @@ Required structure:
 }}
 """
 
+
+def validate_quests(content: str) -> list[Quest]:
+    content = content.strip()
+    content = re.sub(
+        r"^```(?:json)?\s*|\s*```$",
+        "",
+        content,
+        flags=re.IGNORECASE,
+    )
+
+    data = json.loads(content)
+    quests = [Quest.model_validate(item) for item in data["quests"]]
+
+    if len(quests) != 3:
+        raise ValueError("Expected exactly 3 quests.")
+
+    if any(len(quest.tasks) != 3 for quest in quests):
+        raise ValueError("Each quest must have exactly 3 tasks.")
+
+    return quests
+
+
+def generate_with_ollama(prompt: str) -> list[Quest]:
+    response = ollama.chat(
+        model="gemma3:4b",
+        messages=[{"role": "user", "content": prompt}],
+        format="json",
+        options={"temperature": 0.7},
+    )
+    return validate_quests(response["message"]["content"])
+
+
+def generate_with_gemini(prompt: str) -> list[Quest]:
+    from google import genai
+    from google.genai import types
+
+    api_key = (
+        os.getenv("GEMINI_API_KEY")
+        or os.getenv("GOOGLE_GENERATIVE_AI_API_KEY")
+    )
+    if not api_key:
+        raise RuntimeError("Gemini API key is not configured.")
+
+    client = genai.Client(api_key=api_key)
+
+    response = client.models.generate_content(
+        model=os.getenv("GEMINI_MODEL", "gemini-2.5-flash"),
+        contents=prompt,
+        config=types.GenerateContentConfig(
+            response_mime_type="application/json",
+            temperature=0.7,
+        ),
+    )
+
+    if not response.text:
+        raise ValueError("Gemini returned an empty response.")
+
+    return validate_quests(response.text)
+
+
+@app.post("/api/quests", response_model=QuestResponse)
+def generate_quests(request: QuestRequest):
+    prompt = build_prompt(request)
+
+    # Explicit provider setting wins. Otherwise, use Gemini when its
+    # key exists, and Ollama when running locally without a Gemini key.
+    provider = os.getenv("AI_PROVIDER", "").strip().lower()
+
+    if provider not in ("", "gemini", "ollama"):
+        raise HTTPException(
+            status_code=500,
+            detail="AI_PROVIDER must be 'gemini' or 'ollama'.",
+        )
+
+    use_gemini = (
+        provider == "gemini"
+        or (
+            provider == ""
+            and bool(
+                os.getenv("GEMINI_API_KEY")
+                or os.getenv("GOOGLE_GENERATIVE_AI_API_KEY")
+            )
+        )
+    )
+
     try:
-        response = ollama.chat(
-            model="gemma3:4b",
-            messages=[{"role": "user", "content": prompt}],
-            format="json",
-            options={"temperature": 0.7},
-        )
+        if use_gemini:
+            quests = generate_with_gemini(prompt)
+            return QuestResponse(
+                quests=quests,
+                model=os.getenv("GEMINI_MODEL", "gemini-2.5-flash"),
+                generated_locally=False,
+            )
 
-        content = response["message"]["content"].strip()
-        content = re.sub(
-            r"^```(?:json)?\s*|\s*```$",
-            "",
-            content,
-            flags=re.IGNORECASE,
-        )
-
-        data = json.loads(content)
-        quests = [Quest.model_validate(item) for item in data["quests"]]
-
-        if len(quests) != 3:
-            raise ValueError("Expected exactly 3 quests.")
-
-        if any(len(quest.tasks) != 3 for quest in quests):
-            raise ValueError("Each quest must have exactly 3 tasks.")
-
+        quests = generate_with_ollama(prompt)
         return QuestResponse(
             quests=quests,
             model="gemma3:4b",
@@ -121,7 +200,13 @@ Required structure:
         )
 
     except Exception as exc:
+        # Keep secrets out of public error responses and logs.
+        print(f"Quest generation failed ({'gemini' if use_gemini else 'ollama'}): {exc}")
         raise HTTPException(
             status_code=502,
-            detail=f"Could not generate quests. Check Ollama and Gemma. {exc}",
+            detail=(
+                "Could not generate quests. Please try again later."
+                if use_gemini
+                else "Could not generate quests. Check that Ollama and Gemma are running."
+            ),
         ) from exc
