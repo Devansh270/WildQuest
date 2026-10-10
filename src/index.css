@@ -1,0 +1,28 @@
+
+:root {
+  color-scheme: light;
+}
+
+html {
+  min-width: 320px;
+  scroll-behavior: smooth;
+}
+
+body {
+  margin: 0;
+}
+
+button:focus-visible,
+a:focus-visible {
+  outline: 3px solid #90aa7d;
+  outline-offset: 4px;
+}
+
+button {
+  -webkit-tap-highlight-color: transparent;
+}
+
+::selection {
+  background: #dbe8d1;
+  color: #203f2e;
+}
