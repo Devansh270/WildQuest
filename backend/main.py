@@ -2,27 +2,40 @@
 import json
 import os
 import re
+import traceback
+from pathlib import Path
 
-import ollama
+from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
+from google import genai
+from google.genai import types
 from pydantic import BaseModel, Field
+
+# Load WildQuest/.env when running locally.
+env_path = Path(__file__).resolve().parent.parent / ".env"
+load_dotenv(env_path)
+
+GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.1-flash")
+API_KEY = (
+    os.getenv("GEMINI_API_KEY")
+    or os.getenv("GOOGLE_GENERATIVE_AI_API_KEY")
+)
 
 app = FastAPI(
     title="WildQuest API",
-    description="Outdoor adventures powered by AI",
-    version="1.1.0",
+    description="Outdoor adventures powered by Gemini AI",
+    version="2.0.0",
 )
 
-# Local Vite frontend + deployed Vercel frontend
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[
-    "http://localhost:5173",
-    "http://127.0.0.1:5173",
-    "https://wild-quest-psi.vercel.app",
-    "https://wild-quest-4auzlw2dk-devansh-55f9.vercel.app",
-],
+        "http://localhost:5173",
+        "http://127.0.0.1:5173",
+        "https://wild-quest-psi.vercel.app",
+        "https://wild-quest-4auzlw2dk-devansh-55f9.vercel.app",
+    ],
     allow_credentials=False,
     allow_methods=["GET", "POST"],
     allow_headers=["Content-Type"],
@@ -49,22 +62,6 @@ class QuestResponse(BaseModel):
     quests: list[Quest]
     model: str
     generated_locally: bool
-
-
-@app.get("/api/health")
-def health():
-    provider = (
-        "gemini"
-        if os.getenv("GEMINI_API_KEY")
-        or os.getenv("GOOGLE_GENERATIVE_AI_API_KEY")
-        else "ollama"
-    )
-    return {
-        "status": "ok",
-        "app": "WildQuest",
-        "model": "gemini" if provider == "gemini" else "gemma3:4b",
-        "provider": provider,
-    }
 
 
 def build_prompt(request: QuestRequest) -> str:
@@ -100,8 +97,27 @@ Required structure:
 """
 
 
-def validate_quests(content: str) -> list[Quest]:
-    content = content.strip()
+def generate_gemini_quests(request: QuestRequest) -> list[Quest]:
+    if not API_KEY:
+        raise RuntimeError(
+            "Gemini API key is missing. Configure it in the backend environment."
+        )
+
+    client = genai.Client(api_key=API_KEY)
+
+    response = client.models.generate_content(
+        model=GEMINI_MODEL,
+        contents=build_prompt(request),
+        config=types.GenerateContentConfig(
+            response_mime_type="application/json",
+            temperature=0.7,
+        ),
+    )
+
+    if not response.text:
+        raise ValueError("Gemini returned an empty response.")
+
+    content = response.text.strip()
     content = re.sub(
         r"^```(?:json)?\s*|\s*```$",
         "",
@@ -121,93 +137,32 @@ def validate_quests(content: str) -> list[Quest]:
     return quests
 
 
-def generate_with_ollama(prompt: str) -> list[Quest]:
-    response = ollama.chat(
-        model="gemma3:4b",
-        messages=[{"role": "user", "content": prompt}],
-        format="json",
-        options={"temperature": 0.7},
-    )
-    return validate_quests(response["message"]["content"])
-
-
-def generate_with_gemini(prompt: str) -> list[Quest]:
-    from google import genai
-    from google.genai import types
-
-    api_key = (
-        os.getenv("GEMINI_API_KEY")
-        or os.getenv("GOOGLE_GENERATIVE_AI_API_KEY")
-    )
-    if not api_key:
-        raise RuntimeError("Gemini API key is not configured.")
-
-    client = genai.Client(api_key=api_key)
-
-    response = client.models.generate_content(
-        model=os.getenv("GEMINI_MODEL", "gemini-3.1-flash"),
-        contents=prompt,
-        config=types.GenerateContentConfig(
-            response_mime_type="application/json",
-            temperature=0.7,
-        ),
-    )
-
-    if not response.text:
-        raise ValueError("Gemini returned an empty response.")
-
-    return validate_quests(response.text)
+@app.get("/api/health")
+def health():
+    return {
+        "status": "ok",
+        "app": "WildQuest",
+        "provider": "gemini",
+        "model": GEMINI_MODEL,
+        "api_key_configured": bool(API_KEY),
+    }
 
 
 @app.post("/api/quests", response_model=QuestResponse)
 def generate_quests(request: QuestRequest):
-    prompt = build_prompt(request)
-
-    # Explicit provider setting wins. Otherwise, use Gemini when its
-    # key exists, and Ollama when running locally without a Gemini key.
-    provider = os.getenv("AI_PROVIDER", "").strip().lower()
-
-    if provider not in ("", "gemini", "ollama"):
-        raise HTTPException(
-            status_code=500,
-            detail="AI_PROVIDER must be 'gemini' or 'ollama'.",
-        )
-
-    use_gemini = (
-        provider == "gemini"
-        or (
-            provider == ""
-            and bool(
-                os.getenv("GEMINI_API_KEY")
-                or os.getenv("GOOGLE_GENERATIVE_AI_API_KEY")
-            )
-        )
-    )
-
     try:
-        if use_gemini:
-            quests = generate_with_gemini(prompt)
-            return QuestResponse(
-                quests=quests,
-                model=os.getenv("GEMINI_MODEL", "gemini-2.5-flash"),
-                generated_locally=False,
-            )
-
-        quests = generate_with_ollama(prompt)
+        quests = generate_gemini_quests(request)
         return QuestResponse(
             quests=quests,
-            model="gemma3:4b",
-            generated_locally=True,
+            model=GEMINI_MODEL,
+            generated_locally=False,
         )
-
     except Exception as exc:
-        # Keep secrets out of public error responses and logs.
-        print(f"Quest generation failed ({'gemini' if use_gemini else 'ollama'}): {exc}")
+        # Print the actual failure in the backend logs for debugging.
+        print(f"Gemini quest generation failed: {exc}")
+        traceback.print_exc()
+
         raise HTTPException(
             status_code=502,
-            detail=(
-                "Could not generate quests. Please try again later."
-                if use_gemini
-                else "Could not generate quests. Check that Ollama and Gemma are running."
-            ),
+            detail="Could not generate quests. Check the backend logs.",
         ) from exc
